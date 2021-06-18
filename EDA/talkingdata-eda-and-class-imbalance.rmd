@@ -1,0 +1,792 @@
+---
+title: "TalkingData Exploratory Analysis and Class Imbalance"
+output:
+  html_document:
+    fig_height: 4
+    fig_width: 7
+    theme: cosmo
+    highlight: tango
+    number_sections: true
+    fig_caption: true
+    toc: true
+    code_folding: hide
+---
+
+# Introduction
+
+Here is an Exploratory Data Analysis for the TalkingData AdTracking Fraud Detection Challenge competition 
+within the R environment of the 
+[data.table](https://cran.r-project.org/web/packages/data.table/vignettes/datatable-intro.html), 
+[ggplot2](http://ggplot2.tidyverse.org/) and [caret](http://topepo.github.io/caret/index.html). We are provided with a really generous dataset with 240 million rows 
+and here I will use only its part. Our task is to build an algorithm that predicts whether a user will download an app after clicking an ad.
+The competition is a binary classification problem with [ROC-AUC](https://en.wikipedia.org/wiki/Receiver_operating_characteristic) evaluation metric.
+
+Let's prepare and have a look at the dataset.
+
+# Preparations {.tabset .tabset-fade .tabset-pills}
+
+## Load libraries
+Here we load libraries for data wrangling and visualisation.
+```{r, message=FALSE, warning=FALSE, results='hide'}
+library(data.table)
+library(ggplot2)
+library(DT)
+library(magrittr)
+library(corrplot)
+library(Rmisc)
+library(ggalluvial)
+library(caret)
+library(ModelMetrics)
+require(scales)
+library(irlba)
+library(forcats)
+library(forecast)
+library(TSA)
+library(zoo)
+library(skimr)
+library(fasttime)
+```
+
+## Load data
+We use **fread** function from the **data.table** package to speed up loading. Also we use **sample()** function to choose rows from the train set.
+The files are large and **data.table** handles big files efficiently.
+
+```{r, message=FALSE, warning=FALSE, results='hide'}
+train <- fread("../input/train.csv", showProgress=F)
+test <- fread("../input/test.csv", nrows=1e5, showProgress=F)
+subm <- fread("../input/sample_submission.csv", nrows=1e5, showProgress=F)
+
+set.seed(0)
+train <- train[sample(.N, 3e6), ]
+```
+
+```{r include=FALSE}
+options(tibble.width = Inf)
+```
+
+# Glimpse of the dataset {.tabset}
+
+## Train
+```{r, result='asis', echo=FALSE}
+datatable(head(train, 100),class="table-condensed", options = list(
+  columnDefs = list(list(className = 'dt-center', targets = 5)),
+  pageLength = 5,
+  lengthMenu = c(5, 10, 15, 20)
+))
+```
+
+## Test
+```{r, result='asis', echo=FALSE}
+datatable(head(test, 100),class="table-condensed", options = list(
+  columnDefs = list(list(className = 'dt-center', targets = 5)),
+  pageLength = 5,
+  lengthMenu = c(5, 10, 15, 20)
+))
+```
+
+## Sample Submission
+```{r, result='asis', echo=FALSE}
+datatable(head(subm, 100),class="table-condensed", options = list(
+  pageLength = 5,
+  lengthMenu = c(5, 10, 15, 20)
+))
+```
+
+## Missing values
+```{r, result='asis', echo=TRUE}
+cat("Number of missing values in the train set:",  sum(is.na(train)))
+cat("Number of missing values in the test set:",  sum(is.na(test)))
+```
+
+## File info
+```{r inf, result='asis', echo=TRUE}
+cat("Train set file size:", file.size("../input/train.csv"))
+cat("Number of rows in the train set:", nrow(fread("../input/train.csv", select = 1L, showProgress=F)))
+cat("Test set file size:", file.size("../input/test.csv"))
+cat("Number of rows in the test set:", nrow(fread("../input/test.csv", select = 1L, showProgress=F)))
+```
+
+# Dataset columns
+
+```{r, result='asis'}
+str(train)
+```
+
+There is a total of 7 features: 
+
+* **ip**: ip address of click
+* **app**: app id for marketing
+* **device**: device type id of user mobile phone
+* **os**: os version id of user mobile phone
+* **channel**: channel id of mobile ad publisher
+* **click_time**: timestamp of click (UTC)
+* **attributed_time**: if user download the app for after clicking an ad, this is the time of the app download
+
+*Nota bene*:
+
+* **is_attributed** is a binary target to predict 
+* **ip**, **app**, **device**, **os**, **channel** are encoded
+* **attributed_time** is not available in the test set
+
+Let's have a look at features counts:
+
+```{r counts, result='asis',  warning=FALSE, echo=TRUE}
+fea <- c("os", "channel", "device", "app", "attributed_time", "click_time", "ip")
+train[, lapply(.SD, uniqueN), .SDcols = fea] %>%
+  melt(variable.name = "features", value.name = "unique_values") %>%
+  ggplot(aes(reorder(features, -unique_values), unique_values)) +
+  geom_bar(stat = "identity", fill = "steelblue") + 
+  scale_y_log10(breaks = c(50,100,250, 500, 10000, 50000)) +
+  geom_text(aes(label = unique_values), vjust = 1.6, color = "white", size=3.5) +
+  theme_minimal() +
+  labs(x = "features", y = "Number of unique values")
+```
+
+Actually we can treat **ip**, **os**, **channel**, **device**, **app** as categorical features. 
+
+# Summary  with **skimr**
+I've just discovered a [**skimr** package](https://cran.r-project.org/web/packages/skimr/vignettes/Using_skimr.html)
+which makes a nice summary with histograms. Here I've added several count features.
+
+```{r skim, message=FALSE, warning=FALSE}
+fea <- c("ip", "app", "device", "os", "channel" )
+copy(train)[, (fea) := lapply(.SD, factor), .SDcols = fea
+            ][, click_time := fastPOSIXct(click_time)
+              ][, attributed_time := fastPOSIXct(attributed_time)
+                ][, is_attributed := as.logical(is_attributed)
+                  ][, ip_f := .N, by = "ip"
+                    ][, app_f := .N, by = "app"
+                      ][, chan_f := .N, by = "channel"] %>%
+  skim()
+```
+
+# Features visualization
+## Feature vs index  
+
+```{r idx_plt, result='asis',  warning=FALSE, echo=TRUE}
+ggplot(train, aes(x = seq_along(ip), y = ip)) +
+  geom_point(aes(col=factor(is_attributed)), alpha=0.8, size=0.05) +
+  theme_minimal() +
+  scale_y_continuous(labels = comma) + 
+  scale_x_continuous(name="index", labels = comma) +
+  guides(col=guide_legend("is_attributed"))
+
+pi1 <- ggplot(train, aes(x = seq_along(app), y = app)) +
+  geom_point(aes(col=factor(is_attributed)), alpha=0.5, size=0.2) +
+  theme_minimal() +
+  scale_y_continuous(labels = comma) + 
+  scale_x_continuous(name="index", labels = comma) +
+  guides(col=guide_legend("is_attributed")) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+  
+pi2 <- ggplot(train, aes(x = seq_along(device), y = device)) +
+  geom_point(aes(col=factor(is_attributed)), alpha=0.5, size=0.2) +
+  theme_minimal() +
+  scale_y_continuous(labels = comma) + 
+  scale_x_continuous(name="index", labels = comma) +
+  guides(col=guide_legend("is_attributed"))  +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+pi3 <- ggplot(train, aes(x = seq_along(os), y = os)) +
+  geom_point(aes(col=factor(is_attributed)), alpha=0.5, size=0.2) +
+  theme_minimal() +
+  labs(x = "index") +
+  scale_y_continuous(labels = comma) + 
+  scale_x_continuous(name="index", labels = comma) +
+  guides(col=guide_legend("is_attributed"))  +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))   
+  
+pi4 <- ggplot(train, aes(x = seq_along(channel), y = channel)) +
+  geom_point(aes(col=factor(is_attributed)), alpha=0.5, size=0.2) +
+  theme_minimal() +
+  labs(x = "index") +
+  scale_y_continuous(labels = comma) + 
+  scale_x_continuous(name="index", labels = comma) +
+  guides(col=guide_legend("is_attributed")) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))    
+
+multiplot(pi1, pi2, layout = matrix(1:2, 1, 2))
+multiplot(pi3, pi4, layout = matrix(1:2, 1, 2))           
+ ```
+
+## The most frequent values of categorical features {.tabset .tabset-fade .tabset-pills}
+
+```{r freq2, result='asis',  warning=FALSE, echo=TRUE}
+p1 <- train[, .N, by = os][order(-N)][1:10] %>% 
+  ggplot(aes(reorder(os, -N), N)) +
+  geom_bar(stat="identity", fill="steelblue") + 
+  theme_minimal() +
+  geom_text(aes(label = round(N / sum(N), 2)), vjust = 1.6, color = "white", size=2.5) +
+  labs(x = "os") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+
+p2 <- train[, .N, by = channel][order(-N)][1:10] %>% 
+  ggplot(aes(reorder(channel, -N), N)) +
+  geom_bar(stat="identity", fill="steelblue") + 
+  theme_minimal() +
+  geom_text(aes(label = round(N / sum(N), 2)), vjust = 1.6, color = "white", size=2.5) +
+  labs(x = "channel") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+
+p3 <- train[, .N, by = device][order(-N)][1:10] %>% 
+  ggplot(aes(reorder(device, -N), N)) +
+  geom_bar(stat="identity", fill="steelblue") + 
+  theme_minimal() +
+  geom_text(aes(label = round(N / sum(N), 2)), vjust = 1.6, color = "white", size=2.5) +
+  labs(x = "device") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+
+p4 <- train[, .N, by = app][order(-N)][1:10] %>% 
+  ggplot(aes(reorder(app, -N), N)) +
+  geom_bar(stat="identity", fill="steelblue") + 
+  theme_minimal() +
+  geom_text(aes(label = round(N / sum(N), 2)), vjust = 1.6, color = "white", size=2.5) +
+  labs(x = "app") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))       
+
+multiplot(p1, p2, p3, p4, layout = matrix(1:4, 2, 2))     
+```
+
+We can assume that the first two most popular mobile operating systems are some 
+versions of Android followed by iOS. The same considerations can be applied to **device** (e.g. "some Android device").
+
+Let's peek at the **ip**:
+
+```{r, result='asis',  warning=FALSE, echo=TRUE}
+summary(train$ip)
+```
+
+```{r ip, result='asis',  warning=FALSE, echo=TRUE}
+p5 <- train[, .N, by = ip][order(-N)][1:10] %>% 
+  ggplot(aes(reorder(ip, -N), N)) +
+  geom_bar(stat="identity", fill="steelblue") + 
+  theme_minimal() +
+  geom_text(aes(label = round(N / sum(N), 2)), vjust = 1.6, color = "white", size=2.5) +
+  labs(x = "ip")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+p6 <- train[, "ip"][order(ip)] %>% unique() %>% 
+  ggplot() +
+  geom_point(aes(x=seq_along(ip), y=ip), size = 0.25, shape=18)+
+  theme_minimal() +
+  labs(x = "") +
+  scale_y_continuous(name="ip", labels = scales::comma) + 
+  scale_x_continuous(labels = scales::comma) 
+multiplot(p6, p5, layout = matrix(1:2, 1, 2))           
+```      
+
+It looks like **ip** (and other features) just was encoded with sequential integers with a strange elbow (may be due to sampling or 
+different encoding, which makes **ip** an unreliable feature). 
+It's interesting that about 50% of all events are generated by 3 addresses. Those must be some 
+large networks.
+
+## PCA
+Although I'm not sure that PCA can be applied to this enourmously large dataset
+I want to use a truncated principal components analysis in order to see
+if we can separate zeros from ones. I use **prcomp_irlba** function from the 
+[**irlba**](https://cran.r-project.org/web/packages/irlba/index.html) package.
+
+```{r pca1, result='asis', echo=TRUE}
+tr <- train[sample(.N, 3e5)]
+
+y <- factor(tr$is_attributed)
+fea <- c("ip", "app", "device", "os", "channel")
+
+tr[, (fea) := lapply(.SD, as.factor), .SDcols = fea
+   ][, (fea) := lapply(.SD, fct_lump, prop=0.002), .SDcols = fea
+     ][, c("click_time", "is_attributed") := NULL]
+
+tr <- model.matrix(~.-1, tr)
+
+n_comp <- 5
+m_pca <- prcomp_irlba(tr, n = n_comp, scale = TRUE)
+
+qplot(1:n_comp, m_pca$sdev^2/sum(m_pca$sdev^2)*100) + 
+  geom_path() +
+  labs(x = "PC", y = "Variance explained, %") +
+  theme_minimal()
+
+pairs(m_pca$x,
+      col = ifelse(y == 0, alpha("darkolivegreen1", 0.7), "firebrick2"),
+      cex = ifelse(y == 0, 0.1, 0.1),
+      pch = 19)
+```
+
+## H2O Autoencoder
+
+```{r aec0, include=FALSE}
+h2o::h2o.init(nthreads = 4, max_mem_size = "4G")
+tr_h2o <- h2o::as.h2o(tr)
+rm(tr, m_pca); gc()
+m_aec <- h2o::h2o.deeplearning(training_frame = tr_h2o,
+                               x = 1:ncol(tr_h2o),
+                               autoencoder=T,
+                               activation="Tanh",
+                               sparse = T,
+                               hidden = c(64, n_comp, 64),
+                               max_w2 = 2,
+                               epochs = 25)
+tr_aec <- as.data.table(h2o::h2o.deepfeatures(m_aec, tr_h2o, layer = 2))
+```
+
+```{r aec2, result='asis', echo=TRUE}
+pairs(tr_aec,
+      col = ifelse(y == 0, alpha("darkolivegreen1", 0.1), "firebrick2"),
+      cex = ifelse(y == 0, 0.1, 0.2),
+      pch = 19)
+```
+
+```{r aec3, include=FALSE}
+rm(tr_aec, m_aec, m_pca); gc()
+h2o::h2o.shutdown(prompt = FALSE)      
+```
+
+# Feature interactions
+## Pairwise correlations
+
+```{r cor, result='asis',  warning=FALSE, echo=TRUE}
+train[, -c("click_time", "attributed_time"), with=F] %>%
+  cor(method = "spearman") %>%
+  corrplot(type="lower", method = "number", tl.col = "black", diag=FALSE)
+```
+
+Only **app** somehow correlates with **channel**. 
+Well, not much, but what did we want from the categorical features and Spearman's correlation?
+
+The next step is to convert categorical variables to factors. After that we can get 
+a one-hot encoded matrix for the most frequent categories. Then we'll get a correlation matrix for the OHE matrix.
+
+```{r cor2, result='asis',  warning=FALSE, echo=TRUE}
+X <- copy(train)[, -c("click_time", "attributed_time"), with=F][sample(.N, 1e6)]
+fea <- c("ip", "app", "device", "os", "channel")
+for (f in fea) {
+  levels <- sort(names(which(table(X[[f]]) > 300)))
+  X[[f]] <- factor(X[[f]], levels=levels)
+}
+
+m <- model.matrix(~.-1, X) %>% cor(method = "spearman")
+m[is.na(m)] <- 0 
+corrplot(m, type="full", method = "color", tl.pos = "n", cl.pos = "n", diag = T)
+```
+
+On the correlation plot there are some really high-correlated features. Let's create a more detailed figure.
+
+```{r cor3, result='asis',  warning=FALSE, echo=TRUE}
+diag(m) <- 0
+keep <- colSums(abs(m) > 0.75) > 0
+corrplot(m[keep, keep], type = "lower", method = "number", tl.col = "black", diag = F, number.cex = 11/sum(keep))
+
+rm(m, fea, keep)
+```
+
+We have found that some types of **channel** are highly correlated with **app** as well as **os** with **device**, e.g.,
+the correlation between **channel**==(484,361) and **app**==(47,94) is equal to 1.
+
+## Pairwise relationships 
+Here we examine relations for some binary pairings with high correlation.
+
+```{r cor4, result='asis',  warning=FALSE, echo=TRUE}
+m <- model.matrix(~ . - 1, X)
+
+pc0 <- data.table(app22=as.logical(m[, colnames(m) =="app22"]), channel116=as.logical(m[, colnames(m) =="channel116"])) %>% 
+  ggplot(aes(app22, channel116)) +
+  geom_count(color = "orange") +
+  theme_minimal()
+
+pc1 <- data.table(app47=as.logical(m[, colnames(m) =="app47"]), channel484=as.logical(m[, colnames(m) =="channel484"])) %>% 
+  ggplot(aes(app47, channel484)) +
+  geom_count(color = "orange") +
+  theme_minimal()
+  
+pc2 <- data.table(app94=as.logical(m[, colnames(m) =="app94"]), channel361=as.logical(m[, colnames(m) =="channel361"])) %>% 
+  ggplot(aes(app94, channel361)) +
+  geom_count(color = "orange") +
+  theme_minimal()  
+
+pc3 <- data.table(os607=as.logical(m[, colnames(m) =="os607"]), device3032=as.logical(m[, colnames(m) =="device3032"])) %>% 
+  ggplot(aes(os607, device3032)) +
+  geom_count(color = "orange") +
+  theme_minimal()  
+ 
+pc4 <- data.table(os748=as.logical(m[, colnames(m) =="os748"]), device3543=as.logical(m[, colnames(m) =="device3543"])) %>% 
+  ggplot(aes(os748, device3543)) +
+  geom_count(color = "orange") +
+  theme_minimal()  
+  
+pc5 <- data.table(device1=as.logical(m[, colnames(m) =="device1"]), device2=as.logical(m[, colnames(m) =="device2"])) %>% 
+  ggplot(aes(device1, device2)) +
+  geom_count(color = "orange") +
+  theme_minimal()   
+  
+pc6 <- data.table(app56=as.logical(m[, colnames(m) =="app56"]), channel406=as.logical(m[, colnames(m) =="channel406"])) %>% 
+  ggplot(aes(app56, channel406)) +
+  geom_count(color = "orange") +
+  theme_minimal()  
+
+pc7 <- data.table(app8=as.logical(m[, colnames(m) =="app8"]), channel145=as.logical(m[, colnames(m) =="channel145"])) %>% 
+  ggplot(aes(app8, channel145)) +
+  geom_count(color = "orange") +
+  theme_minimal()  
+
+multiplot(pc0, pc1, pc2, pc3, layout = matrix(1:4, 2, 2))
+multiplot(pc4, pc5, pc6, pc7, layout = matrix(1:4, 2, 2))   
+
+rm(X, m, fea, keep)
+```
+
+
+## Alluvial diagram
+
+This kind of plot is useful for discovering of multi-feature interactions.
+The vertical size of each block is proportional to the frequency of the feature.
+The next plot shows high flows from **device** 0 & 1 to the corresponding **os**, **app**, 
+**channel** when **is_attributed** is equal to 1.In paticular we can see 
+that **device**==1 doesn’t use **os**==0 and **device**==0 doesn’t use **os**==19 etc.
+
+```{r allu1, result='asis', warning=FALSE, echo=TRUE}
+copy(train)[is_attributed == 1
+      ][, freq := .N, keyby = .(device, os, app, channel)
+        ][freq > 15] %>% 
+  unique() %>% 
+  ggplot(aes(weight = freq, axis1 = device, axis2 = os, axis3 = app, axis4 = channel)) +
+  geom_alluvium(aes(fill = is_attributed), width = 1/12) +
+  geom_stratum(width = 1/12, fill = "black", color = "grey") +
+  geom_label(stat = "stratum", label.strata = TRUE) +
+  theme_minimal() +
+  scale_x_continuous(breaks = 1:4, labels = c("device", "os", "app", "channel"))
+```
+
+# Time patterns
+## Basic plots
+This part of the EDA is devoted to time patterns. 
+
+```{r time1, result='asis', warning=FALSE, echo=TRUE}
+set.seed(0)
+X <- copy(train)[, `:=`(hour = hour(click_time),
+                        mday = mday(click_time),
+                        click_time = as.POSIXct(click_time, format="%Y-%m-%d %H:%M:%S"),
+                        is_attributed = factor(is_attributed))]
+
+pt1 <- X[, .N, by = "hour"] %>% 
+  ggplot(aes(hour, N)) + 
+  geom_bar(stat="identity", fill="steelblue") + 
+  ggtitle("Number of clicks per hour")+
+  xlab("Hour") + 
+  ylab("Number of clicks")+
+  theme_minimal()
+
+pt2 <- X[is_attributed==1, .N, by = c("hour", "is_attributed")] %>% 
+  ggplot(aes(hour, N)) + 
+  geom_bar(stat="identity", fill="steelblue") + 
+  ggtitle("Number of downloads per hour")+
+  xlab("Hour") + 
+  ylab("Number of downloads")+
+  theme_minimal()
+
+multiplot(pt1, pt2, layout = matrix(1:2, 1, 2))              
+```
+
+In the first figure we can observe that the minimal number of clicks occurs at about 20H. 
+The number of downloads in general follows the same pattern.
+
+The next two plots show click patterns grouped by hour and day.
+
+```{r time2, result='asis', warning=FALSE, echo=TRUE}
+X[, .N, by = c("hour", "mday")
+  ][, dt := as.POSIXct(paste0("2017-11-", mday, " ", hour), format="%Y-%m-%d %H")] %>% 
+  ggplot(aes(dt, N)) + 
+  geom_line(color="steelblue") +
+  ggtitle("Clicks per hour")+
+  xlab("Day-Hour") + 
+  ylab("Number of clicks")+
+  theme_minimal()+
+  scale_x_datetime(labels = date_format("%d-%HH"), date_breaks = "8 hours")
+
+X[, .N, by = c("hour", "mday", "is_attributed")
+  ][, dt := as.POSIXct(paste0("2017-11-", mday, " ", hour), format="%Y-%m-%d %H")] %>% 
+  ggplot(aes(dt, N)) + 
+  geom_line(aes(color = is_attributed), size = 0.5) +
+  stat_smooth(aes(color = is_attributed))+
+  ggtitle("Clicks per hour")+
+  xlab("Day-Hour") + 
+  ylab("Number of clicks")+
+  scale_y_log10(breaks=c(10, 100, 200, 400, 1000, 5000, 20000, 40000, 60000)) +
+  theme_minimal()+
+  scale_x_datetime(labels = date_format("%d-%HH"), date_breaks = "8 hours")
+```
+
+There is a usual daily temporal structure in the number of clicks and downloads.
+
+## ARIMA model for TS
+Let's create a time series for the number of downloads per hour and 
+feed it to the **auto.arima** model.
+
+```{r ts1, result='asis', warning=FALSE, echo=TRUE}
+# Some magic for irregular ts
+dts <- data.table(freq=0, dt = seq(min(X$click_time),
+                                   max(X$click_time), by="hour")
+)[, dt:=as.POSIXct(as.character(dt), format="%Y-%m-%d %H")]
+
+y <- X[, .N, by = c("hour", "mday", "is_attributed")
+           ][, dt := as.POSIXct(paste0("2017-11-", mday, " ", hour), format="%Y-%m-%d %H")
+             ][order(dt)
+               ][is_attributed==1
+                 ][dts, on = "dt"
+                   ][is.na(N), N:=0] %>% 
+  with(zoo(N, order.by=dt))
+
+
+autoplot(y)+
+  theme_minimal()+
+  stat_smooth()+
+  xlab("Day-Hour") + 
+  ylab("Number of downloads")+
+  scale_x_datetime(labels = date_format("%d-%HH"), date_breaks = "6 hours")
+
+m_aa <- auto.arima(y)
+summary(m_aa)
+
+autoplot(forecast(m_aa, h=12)) + theme_minimal()
+```
+
+We've got ARMA(2,2) process. Forecasting for the next 12 hours gives a wide 95% confidence interval.
+Maybe, with some additional tuning ARIMA model can give more useful information.
+Let's add some Fourier terms to the ARIMA model.
+
+```{r ts2, result='asis',  warning=FALSE, echo=TRUE}
+ndiffs(y)
+```
+
+We can see that this time series is stationary. Let's detect "power" frequencies with a periodogram.
+
+```{r ts3, result='asis',  warning=FALSE, echo=TRUE}
+p <- periodogram(y)
+data.table(period = 1/p$freq, spec = p$spec)[order(-spec)][1]
+```
+
+Surprisingly, we have a period of 25h. Now we're ready to find Fourier terms for this ts.
+
+```{r ts4, result='asis',  warning=FALSE, echo=TRUE}
+(bestfit <- list(aicc=m_aa$aicc, i=0, fit=m_aa))
+
+for(i in 1:10) {
+  z <- fourier(ts(y, frequency = 25), K = i)
+  m_aa <- auto.arima(y, xreg = z, seasonal = F)
+  if (m_aa$aicc < bestfit$aicc) {
+    bestfit <- list(aicc = m_aa$aicc, i = i, fit = m_aa)
+  }
+}
+bestfit
+
+fc <- forecast(bestfit$fit, xreg = fourier(ts(y, frequency = 25), K = bestfit$i, h = 12))
+autoplot(fc) + theme_minimal()
+```
+
+Now the forecast plot looks much nicer - the confidence interval is more narrow.
+
+# Target and features importance
+
+```{r plot_target, result='asis',  warning=FALSE, echo=TRUE}
+p7 <- train[, .N, by = is_attributed] %>% 
+      ggplot(aes(is_attributed, N)) +
+      geom_bar(stat="identity", fill="steelblue") + 
+      theme_minimal() +
+      geom_text(aes(label = N), vjust = -0.5, color = "black", size=2.5)
+      
+p8 <- train[sample(.N, 10000), .(app, is_attributed)] %>% 
+    ggplot(aes(app, is_attributed)) +
+    stat_smooth(method="loess", formula=y~x, alpha=0.25, size=1.5) +
+    geom_point(position=position_jitter(height=0.025, width=0), size=1, alpha=0.2) +
+    xlab("app") + ylab("P(is_attributed)")+
+    theme_minimal()  
+    
+p9 <- train[sample(.N, 10000), .(device, is_attributed)] %>% 
+    ggplot(aes(device, is_attributed)) +
+    stat_smooth(method="glm", formula=y~x, alpha=0.25, size=1.5) +
+    geom_point(position=position_jitter(height=0.025, width=0), size=1, alpha=0.2) +
+    xlab("device") + ylab("P(is_attributed)")+
+    theme_minimal()   
+    
+p10 <- train[sample(.N, 10000), .(os, is_attributed)] %>% 
+    ggplot(aes(os, is_attributed)) +
+    stat_smooth(method="loess", formula=y~x, alpha=0.25, size=1.5) +
+    geom_point(position=position_jitter(height=0.025, width=0), size=1, alpha=0.2) +
+    xlab("os") + ylab("P(is_attributed)")+
+    theme_minimal()   
+    
+multiplot(p7, p8, layout = matrix(1:2, ncol=2))
+multiplot(p9, p10, layout = matrix(1:2, ncol=2)) 
+```
+
+Here we can observe a class imbalance problem. To address that we can use, for example,
+[subsampling techniques](http://topepo.github.io/caret/subsampling-for-class-imbalances.html) like SMOTE or ROSE 
+or some robust model. But now I just add some time features, create a simple xgb model and plot feature importance.
+
+```{r orig, result='asis',  warning=FALSE, echo=TRUE}
+X <- copy(train)[, `:=`(hour = hour(click_time),
+                        wday = wday(click_time),
+                        minute = minute(click_time))
+                 ][, c("click_time", "attributed_time", "is_attributed") := NULL]
+y <- train$is_attributed
+
+tri <- createDataPartition(y, p = 0.6, list = F)
+
+X_val <- X[-tri] 
+y_val <- y[-tri]
+
+X <- X[tri]
+X$y <- factor(ifelse(train$is_attributed[tri] == 0, "zero", "one"))
+str(X)
+
+ctrl <- trainControl(method = "cv", 
+                     number = 4,
+                     classProbs = T,
+                     summaryFunction = twoClassSummary)
+
+grid <- expand.grid(nrounds = 95, 
+                    max_depth = 7, 
+                    eta = 0.2, 
+                    gamma = 0,
+                    min_child_weight = 5,
+                    colsample_bytree = 0.7, 
+                    subsample = 0.7)
+
+set.seed(0)
+m_xgb <- train(y ~ ., data = X,
+               method = "xgbTree",
+               nthread = 8,
+               metric = "ROC",
+               tuneGrid = grid,
+               trControl = ctrl)
+getTrainPerf(m_xgb)
+```
+
+```{r, result='asis',  warning=FALSE, echo=FALSE}
+ggplot(varImp(m_xgb)) + theme_minimal()
+```
+
+It appears that **app** is the most important feature.
+
+# Class imbalance
+Let's try to use sampling techniques to deal with unbalanced classes.
+
+## Original target
+
+```{r, result='asis',  warning=FALSE, echo=TRUE}
+table(y)
+```
+
+## XGB with downsampling
+
+```{r down, result='asis',  warning=FALSE, echo=TRUE}
+set.seed(0)
+ctrl$sampling <- "down"
+grid$nrounds <- 35
+m_xgb_down <- train(y ~ ., data = X,
+                    method = "xgbTree",
+                    nthread = 8,
+                    metric = "ROC",
+                    tuneGrid = grid,
+                    trControl = ctrl)
+```                     
+                     
+## XGB with upsampling
+
+```{r up, result='asis',  warning=FALSE, echo=TRUE}
+set.seed(0)
+ctrl$sampling <- "up"
+grid$nrounds <- 35
+m_xgb_up <- train(y ~ ., data = X,
+                    method = "xgbTree",
+                    nthread = 8,
+                    metric = "ROC",
+                    tuneGrid = grid,
+                    trControl = ctrl)                     
+```   
+
+## XGB with ROSE
+
+```{r rose,  warning=FALSE, echo=TRUE, results='hide'}
+set.seed(0)
+ctrl$sampling <- "rose"
+grid$nrounds <- 150
+m_xgb_rose <- train(y ~ ., data = X,
+                    method = "xgbTree",
+                    nthread = 8,
+                    metric = "ROC",
+                    tuneGrid = grid,
+                    trControl = ctrl)                     
+```    
+
+## XGB with SMOTE
+
+```{r smote, warning=FALSE, echo=TRUE, results='hide'}
+set.seed(0)
+ctrl$sampling <- "smote"
+grid$nrounds <- 70
+m_xgb_smote <- train(y ~ ., data = X,
+                     method = "xgbTree",
+                     nthread = 8,
+                     metric = "ROC",
+                     tuneGrid = grid,
+                     trControl = ctrl)                    
+``` 
+
+## XGB with scale_pos_weight
+
+```{r spw, warning=FALSE, echo=TRUE, results='hide'}
+set.seed(0)
+ctrl$sampling <- NULL
+grid$nrounds <- 35
+m_xgb_spw <- train(y ~ ., data = X,
+                   method = "xgbTree",
+                   nthread = 8,
+                   metric = "ROC",
+                   scale_pos_weight = 50,
+                   tuneGrid = grid,
+                   trControl = ctrl)                     
+``` 
+
+## Models resampling results
+
+```{r resampl, result='asis',  warning=FALSE, echo=TRUE}
+models <- list(original = m_xgb,
+               down = m_xgb_down,
+               up = m_xgb_up,
+               SMOTE = m_xgb_smote,
+               ROSE = m_xgb_rose,
+               spw = m_xgb_spw)
+
+set.seed(0)               
+resampling <- resamples(models)
+summary(resampling, metric = "ROC")
+```
+
+It looks like sampling techniques do not increase mean AUC CV score notably.
+
+## The validation set performance
+
+```{r tst, result='asis',  warning=FALSE, echo=TRUE}
+(tst_perf <- models %>% 
+  lapply(function(m) {
+    predict(m, X_val, type = "prob")[, "one"] %>% 
+      auc(y_val, .)}) %>% 
+  do.call("rbind", .) %>% 
+  set_colnames("AUC"))
+```
+
+```{r plot_auc, result='asis',  warning=FALSE, echo=FALSE}
+cbind(summary(resampling, metric = "ROC")$statistics$ROC[, 4], tst_perf) %>% 
+  set_colnames(c("CV", "Validation set")) %>% 
+  as.data.frame() %>% 
+  tibble::rownames_to_column(var = "Sampling") %>% 
+  melt(id.vars="Sampling", variable.name = "Control", value.name = "AUC") %>% 
+  ggplot(aes(Sampling, AUC)) +   
+  geom_bar(aes(fill = Control), position = position_dodge(), stat="identity")+
+  geom_text(aes(label=round(AUC, 2), group=Control), 
+            vjust=1.6, position = position_dodge(width=.9), color="white", size=3)+
+  theme_minimal()
+ ```
+
+As we can see sampling techniques do not help much to improve AUC score for 
+the validation set either. ROSE makes things significantly worse, although upsampling 
+can give a few extra points. It looks like tuning of **scale_pos_weight** can make the model better.
